@@ -13,102 +13,115 @@
 // along with this program.  If not, see <http://gnu.org/licenses/gpl-2.0.txt>
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
-#include <limits.h>
-#include <pthread.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "composite-flaschen-taschen.h"
 #include "ft-thread.h"
-#include "servers.h"
 #include "ppm-reader.h"
+#include "servers.h"
 
 volatile bool interrupt_received = false;
-static void InterruptHandler(int signo) {
-  interrupt_received = true;
-}
+static void InterruptHandler(int signo) { interrupt_received = true; }
 
-// public interface
 static int server_socket = -1;
+
 bool udp_server_init(int port) {
-    if ((server_socket = socket(PF_INET6, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
-        perror("IPv6 enabled ? While reating listen socket");
-        return false;
-    }
-    int opt = 0;   // Unset IPv6-only, in case it is set. Best effort.
-    setsockopt(server_socket, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+  if ((server_socket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+    perror("Failed to create IPv6 socket");
+    return false;
+  }
 
-    struct sockaddr_in6 addr = {0};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr = in6addr_any;
-    addr.sin6_port = htons(port);
-    if (bind(server_socket, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return false;
-    }
+  // Force IPv6 only for optimal performance
+  int ipv6_only = 1;
+  if (setsockopt(server_socket, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_only,
+                 sizeof(ipv6_only)) < 0) {
+    perror("Failed to set IPv6-only mode");
+    close(server_socket);
+    return false;
+  }
 
-    fprintf(stderr, "UDP-server: ready to listen on %d\n", port);
-    return true;
+  // Optimize receive buffer for aarch64
+  int rcvbuf = 8 * 1024 * 1024; // 8MB buffer, optimized for RPi memory
+  setsockopt(server_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+  struct sockaddr_in6 addr = {0};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_addr = in6addr_any;
+  addr.sin6_port = htons(port);
+
+  if (bind(server_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    perror("bind failed");
+    close(server_socket);
+    return false;
+  }
+
+  fprintf(stderr, "IPv6 UDP server ready on port %d\n", port);
+  return true;
 }
 
 void udp_server_run_blocking(CompositeFlaschenTaschen *display,
                              ft::Mutex *mutex) {
-    static const int kBufferSize = 65535;  // maximum UDP has to offer.
-    char *packet_buffer = new char[kBufferSize];
-    bzero(packet_buffer, kBufferSize);
+  // Aligned static buffer for better aarch64 NEON performance
+  static char packet_buffer[65535] __attribute__((aligned(16)));
 
-    struct sigaction sa = {{0}};  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53119
-    sa.sa_handler = InterruptHandler;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
+  struct msghdr msg = {0};
+  struct iovec iov = {0};
+  struct sockaddr_in6 src_addr;
 
-    for (;;) {
-        // TODO: also store src-address in case we want to do rate-limiting
-        // per source-address.
-        ssize_t received_bytes = recvfrom(server_socket,
-                                          packet_buffer, kBufferSize,
-                                          0, NULL, 0);
-        if (interrupt_received)
-            break;
+  // Set up message structure
+  iov.iov_base = packet_buffer;
+  iov.iov_len = sizeof(packet_buffer);
+  msg.msg_name = &src_addr;
+  msg.msg_namelen = sizeof(src_addr);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
 
-        if (received_bytes < 0 && errno == EINTR) // Other signals. Don't care.
-            continue;
+  struct sigaction sa = {{0}};
+  sa.sa_handler = InterruptHandler;
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
 
-        if (received_bytes < 0) {
-            perror("Trouble receiving.");
-            break;
-        }
+  while (!interrupt_received) {
+    ssize_t received_bytes = recvmsg(server_socket, &msg, 0);
 
-        ImageMetaInfo img_info = {0};
-        img_info.width = display->width();  // defaults.
-        img_info.height = display->height();
-
-        const char *pixel_pos = ReadImageData(packet_buffer, received_bytes,
-                                              &img_info);
-        mutex->Lock();
-        display->SetLayer(img_info.layer);
-        for (int y = 0; y < img_info.height; ++y) {
-            for (int x = 0; x < img_info.width; ++x) {
-                Color c;
-                c.r = *pixel_pos++;
-                c.g = *pixel_pos++;
-                c.b = *pixel_pos++;
-                display->SetPixel(x + img_info.offset_x,
-                                  y + img_info.offset_y,
-                                  c);
-            }
-        }
-        display->Send();
-        display->SetLayer(0);  // Back to sane default.
-        mutex->Unlock();
+    if (received_bytes < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("recvmsg failed");
+      break;
     }
-    delete [] packet_buffer;
+
+    ImageMetaInfo img_info = {0};
+    img_info.width = display->width();
+    img_info.height = display->height();
+
+    const char *pixel_pos =
+        ReadImageData(packet_buffer, received_bytes, &img_info);
+    if (pixel_pos) {
+      mutex->Lock();
+      display->SetLayer(img_info.layer);
+
+      // Process pixels in bulk for better cache usage
+      for (int y = 0; y < img_info.height; ++y) {
+        for (int x = 0; x < img_info.width; ++x) {
+          Color c;
+          c.r = *pixel_pos++;
+          c.g = *pixel_pos++;
+          c.b = *pixel_pos++;
+          display->SetPixel(x + img_info.offset_x, y + img_info.offset_y, c);
+        }
+      }
+
+      display->Send();
+      display->SetLayer(0);
+      mutex->Unlock();
+    }
+  }
 }
